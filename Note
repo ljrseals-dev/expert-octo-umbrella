@@ -1,0 +1,247 @@
+README.md — Brute Genius
+
+Below is the full, honest README. It matches what the repository actually does today, with a Status section that separates shipped behavior from roadmap. Replace the existing README.md wholesale.
+
+---
+
+```markdown
+# Brute Genius
+
+Exhaustive combinatorial search as an MCP server. Given a discrete search space, Brute Genius enumerates the full Cartesian product, shards it across workers, scores every combination against a named objective, and returns a ranked list. It does not sample and it does not prune: it tries everything.
+
+**⚠️ Warning — this plugin spends real money.** The default provider is an in-memory mock, but the launch path is written to move real capital the moment you swap in a cloud provider. Always call `brute_genius_plan` first and respect the cost ceiling it returns. `brute_genius_kill` is the emergency stop and is always available.
+
+---
+
+## Status — read before you use this
+
+Brute Genius is under active development. The gap between what it promises and what it delivers today is small but real, and hiding it would be worse than naming it.
+
+### Shipped and working
+
+- Plan, launch, status, results, kill, and probe tools
+- Registry-bound objectives (no caller code execution, ever)
+- Cartesian counting without materialization, with a hard cap of 10⁹ combinations
+- Mixed-radix index decoding — `combo_at(space, k)` returns any combination in O(axes) time
+- Independent shard definitions — each shard enumerates only its own global indices
+- Two-tier abort checks in the scoring loop — post-cancellation work is bounded by one in-flight combination
+- Device detection (CUDA / XPU / MPS / CPU) via `xpu.detect_accelerators()`
+- Provider abstraction with `MockProvider` (in-memory) and `RunPodProvider` (SDK-backed)
+
+### In progress — see Roadmap
+
+- **True parallel scoring.** Shards are evaluated sequentially in-process today. The `GPUProvider` seam exists, but shards are not shipped to remote nodes.
+- **Device-dispatch scoring.** `device` is detected and recorded but scoring currently runs on the host CPU. Vectorized torch objectives are planned.
+- **Ledger-backed balance.** `MockProvider.balance` is a starting figure, not a running total; `charge()` is not yet called at launch.
+- **Remote execution via `RunPodProvider.run_command`.** Currently raises `NotImplementedError` — you must bake a scoring image.
+
+If a claim in this README is not in the Shipped list above, treat it as roadmap.
+
+---
+
+## Install
+
+```bash
+cd brute-genius
+pip install -e ".[test]"
+```
+
+Python ≥ 3.10. Optional extras:
+
+```bash
+pip install -e ".[gpu]"      # torch, for future vectorized objectives
+pip install -e ".[runpod]"   # runpod SDK, for RunPodProvider
+```
+
+---
+
+Connect to Claude Desktop
+
+Edit claude_desktop_config.json:
+
+```json
+{
+  "mcpServers": {
+    "brute-genius": {
+      "command": "python",
+      "args": ["/absolute/path/to/brute-genius/server.py"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. The tools, resources, and prompts below will appear.
+
+For other MCP hosts (Cursor, Copilot, etc.) point at the same stdio command. For remote/HTTP:
+
+```python
+mcp.run(transport="http", host="0.0.0.0", port=8000)
+```
+
+---
+
+Quick test
+
+```bash
+pytest test_server.py -v
+npx @modelcontextprotocol/inspector python server.py
+```
+
+---
+
+Tools
+
+Tool Purpose Cost risk
+brute_genius_plan Validate space + objective, count combinations, compute cost estimate, return plan_id. Refuses if estimate > max_cost_usd. Does not execute anything. None
+brute_genius_launch Provision workers and score every combination. Re-checks balance before dispatch. Yes — provisions and bills
+brute_genius_status Live progress: shards done, combinations evaluated, best-so-far. None
+brute_genius_results Top-k highest-scoring combinations, sorted descending. None
+brute_genius_kill Stop every worker and shard for a plan. Preserves partial results. Always available. None
+xpu_probe Report detected accelerators, provider rates, and current balance. None
+
+Typical flow
+
+1. brute_genius_plan with your space, objective, and a ceiling you are willing to spend.
+2. Inspect the returned estimated_cost_usd and estimated_minutes. If either is unacceptable, do not proceed.
+3. brute_genius_launch with the plan_id.
+4. brute_genius_status while running.
+5. brute_genius_results when done.
+6. brute_genius_kill if anything goes wrong.
+
+---
+
+Resources
+
+URI Contents
+brutegenius://plans All plans and their current states
+brutegenius://plans/{plan_id}/combinations First 1,000 combinations of a plan (paged; the full set is intentionally not materialized)
+brutegenius://hardware Live accelerator inventory
+brutegenius://pricing Per-chip USD/hour rates
+
+---
+
+Prompts
+
+· define_search — walks the user through specifying axes, objective, cost ceiling, and hardware.
+· interpret_results — asks the model to identify the best combination, find patterns in the top-k, and suggest a narrowed follow-up space.
+
+---
+
+Safety guarantees (current)
+
+These are enforced by the code as it exists today. Each is exercised by a test in test_server.py.
+
+1. Plan refuses over ceiling. brute_genius_plan raises rather than returning a plan_id when the estimate exceeds max_cost_usd. No plan record is created.
+2. Hard caps. 64 nodes and 10⁹ combinations, both checked before any work is dispatched.
+3. Registry-only objectives. Objectives are looked up by name. No caller string is passed to eval, exec, compile, pickle.loads, or import. This is structural, not policy.
+4. Kill always works. brute_genius_kill is unconditional and stops every shard associated with a plan_id.
+5. Bounded abort latency. xpu.batch_score checks the kill flag before each combination and again before each batch evaluation. Worst-case post-cancellation work is one combination, not one batch.
+6. Launch re-checks balance. If balance <= 0 or balance < estimate, launch raises before provisioning any node.
+
+Not yet guaranteed (roadmap — see next section)
+
+· Launch does not currently recompute the cost estimate when chip or nodes are overridden at launch time. The ceiling check uses the plan-time estimate.
+· MockProvider.balance is never debited. In the mock, launch cannot actually run out of money. Real providers will inherit the same shape until charge() is wired in.
+· Partial provisioning failures are not rolled back — nodes created before the failure remain running until kill() is called.
+
+---
+
+Roadmap
+
+Next
+
+· Index-arithmetic sharding in enumerator.shard. Current implementation re-walks the full space per shard (Θ(N·T) work); the planned rewrite yields Θ(T) work using the already-shipped combo_at decoder.
+· Recompute cost on launch overrides. Ceiling enforcement must reflect the effective chip and node count, not the plan-time values.
+· Ledger charge before scoring. Add GPUProvider.charge(amount_usd); debit the estimate before dispatch; raise on insufficient funds.
+· Transactional provisioning. Roll back partially provisioned nodes on failure.
+· Progressive result population. Populate plan["results"] as shards complete, so kill() reports real partials.
+
+Later
+
+· True parallelism. Dispatch shards concurrently (asyncio.gather over executor threads or processes). Add a concurrency parameter, default 1, capped at MAX_NODES.
+· Vectorized objectives. Torch-backed versions of sphere / rastrigin / rosenbrock operating on a batch tensor. device then actually influences execution.
+· Remote execution. Implement RunPodProvider.run_command via SSH or a baked scoring image. Add GPUProvider.run_shard(shard_spec) so shards (space + start index + stride) ship to nodes without materializing combinations.
+· Resume from checkpoint. Per-shard k_last persistence; resume from k_last + N with no coordination.
+· Plan TTL / eviction. Bound _plans growth on long-running servers.
+· Refund unused estimate on early kill (requires per-second billing surface).
+· Structured logging. JSON lines with plan_id, shard_idx, event.
+
+---
+
+Architecture
+
+```
+server.py          FastMCP tools, resources, prompts; plan store; safety caps
+enumerator.py      count(), cartesian(), shard(), combo_at()  — lazy, no materialization
+objectives.py      closed registry of named scoring functions
+xpu.py             accelerator detection; batch scoring loop with abort checks
+provider.py        abstract GPUProvider interface
+mock_provider.py   in-memory fleet for tests and local dev
+runpod_provider.py RunPod SDK-backed provider (run_command stubbed)
+```
+
+Design rules:
+
+· The enumerator is lazy. cartesian() yields; nothing materializes T combinations.
+· Objectives are looked up by name from a closed registry. No caller-supplied code path exists.
+· All spend-related operations go through GPUProvider so ceilings and balance checks live in one place.
+· No stdout writes in stdio transport. Use ctx.info or _log (stderr).
+
+---
+
+Testing
+
+```bash
+pytest test_server.py -v
+```
+
+Tests use fastmcp.Client against the live in-memory server. Every test starts with a clean _plans store and a healthy mock balance. Coverage includes:
+
+· Plan validation, ceiling refusal, combination cap
+· Unknown objective rejection
+· Correct shard dispatch and full evaluation
+· Sorted results and best-combination correctness (sphere, linear_sum)
+· Kill semantics, including mid-run abort via monkeypatched slow scorer
+· Status before launch
+· Node-count cap
+· Resource reads
+· Accelerator probe
+
+---
+
+Patent notice
+
+A U.S. utility patent application covering index-arithmetic sharding, registry-bound objective evaluation, two-tier abort checks, and pre-execution cost enforcement is in preparation. Inventor: Lewis James Seals Jr. This notice is not a claim of issued rights; it is disclosure of pending filings for defensive purposes.
+
+---
+
+License
+
+MIT. See pyproject.toml.
+
+```
+
+---
+
+## What changed from the original, and why
+
+| Original claim | Original text | Honest version |
+|---|---|---|
+| "shards it across a fleet of accelerators" | implied parallel remote execution | "shards it across workers"; parallel remote execution is a roadmap item |
+| "Same scoring code runs on CUDA, XPU, MPS, or CPU" (in `xpu.py`) | implied device dispatch | device is detected and recorded; scoring runs on the host CPU until vectorized objectives land |
+| "re-check balance before dispatch" | implied ledger | re-checks balance, does not debit it (mock cannot be drained); charge() is roadmap |
+| "plan() refuses any estimate above max_cost_usd" | true at plan time, not at launch override | true at plan time; override gap is now explicitly listed under "Not yet guaranteed" |
+| "kill() always stops every node" | true | unchanged, still true |
+| "Objectives are registry-only; caller code is never executed" | true | unchanged, still true |
+
+The `Status` section is the most important addition: it forces anyone reading the README to see what is built versus what is planned before they wire this into anything that touches a real account.
+
+If you want to gate the README on the hardening pass instead — i.e., only publish once A1–A6 have landed — replace the entire **Status** section with:
+
+```markdown
+## Status
+
+All capabilities described below are implemented and covered by tests. See `CHANGELOG.md` for the hardening pass that closed the gap between the original draft and the current release.
+```
+
+Only do that after the hardening commit lands and the tests are green. Publishing the gated version early would be the exact oversell this README was written to fix.
